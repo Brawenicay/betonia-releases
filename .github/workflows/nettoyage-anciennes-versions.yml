@@ -1,0 +1,93 @@
+# Supprime automatiquement les anciennes versions 6 heures apres que la NOUVELLE version a ete
+# telechargee (= le client a fait la mise a jour depuis Parametres > Mises a jour).
+#
+# Signal : le compteur de telechargements du Setup de la version de latest.json depasse la valeur
+# "baseline" notee au moment de la publication (.cleanup-state.json, ecrit par release.ps1).
+# Aucun compte ni cle a ajouter : le jeton GitHub interne du depot suffit.
+# Securite : la version annoncee dans latest.json n'est JAMAIS supprimee, ni celles annoncees par un
+# canal client (channels/latest-<code>.json) : un client sur un canal garde sa version.
+name: Nettoyage des anciennes versions
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # toutes les heures
+  workflow_dispatch: {}      # lancement manuel possible (onglet Actions)
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nettoyage
+  cancel-in-progress: false
+
+jobs:
+  nettoyage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verifier le telechargement et supprimer les anciennes versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ATTENTE_SECONDES: "21600"   # 6 heures
+        run: |
+          set -euo pipefail
+          etat=.cleanup-state.json
+          version=$(jq -r .version latest.json)
+          tag="v$version"
+          compteur=$(gh api "repos/$REPO/releases/tags/$tag" --jq '[.assets[].download_count] | add // 0')
+          # Versions protegees : celle de latest.json + celles des canaux clients (s'il y en a).
+          protegees="$tag"
+          for f in channels/latest-*.json; do
+            [ -f "$f" ] || continue
+            protegees="$protegees v$(jq -r .version "$f")"
+          done
+          anciennes=$(gh api "repos/$REPO/releases" --paginate --jq '.[].tag_name' | while read -r t; do
+            case " $protegees " in *" $t "*) ;; *) echo "$t" ;; esac
+          done)
+          echo "Version actuelle $tag, telechargements $compteur"
+          echo "Anciennes versions : ${anciennes:-aucune}"
+
+          enregistrer() {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$etat"
+            git commit -m "$1"
+            git push
+          }
+
+          # Etat absent ou d'une autre version : on part du compteur actuel (prudent).
+          if [ ! -f "$etat" ] || [ "$(jq -r .tag "$etat")" != "$tag" ]; then
+            jq -n --arg t "$tag" --argjson b "$compteur" '{tag:$t, baseline:$b, firstSeen:null}' > "$etat"
+            enregistrer "Nettoyage : suivi de $tag (base $compteur telechargements)"
+            exit 0
+          fi
+
+          if [ -z "$anciennes" ]; then echo "Rien a supprimer."; exit 0; fi
+
+          baseline=$(jq -r .baseline "$etat")
+          if [ "$compteur" -le "$baseline" ]; then
+            echo "La nouvelle version n'a pas encore ete telechargee par le client : on attend."
+            exit 0
+          fi
+
+          maintenant=$(date -u +%s)
+          vu=$(jq -r '.firstSeen // empty' "$etat")
+          if [ -z "$vu" ]; then
+            jq --argjson s "$maintenant" '.firstSeen = $s' "$etat" > "$etat.tmp" && mv "$etat.tmp" "$etat"
+            enregistrer "Nettoyage : $tag telechargee, anciennes versions supprimees dans 6 h"
+            exit 0
+          fi
+
+          ecoule=$((maintenant - vu))
+          if [ "$ecoule" -lt "$ATTENTE_SECONDES" ]; then
+            echo "Telechargee il y a $((ecoule / 60)) min : on attend 6 h."
+            exit 0
+          fi
+
+          for t in $anciennes; do
+            case " $protegees " in *" $t "*) continue ;; esac   # garde-fou : jamais une version annoncee
+            echo "Suppression de $t"
+            gh release delete "$t" --repo "$REPO" --yes --cleanup-tag
+          done
